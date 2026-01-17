@@ -1,0 +1,337 @@
+import React, { useState, useEffect } from 'react';
+import { base44 } from '@/api/base44Client';
+import { useQuery } from '@tanstack/react-query';
+import { Skeleton } from '@/components/ui/skeleton';
+import SearchBar from '@/components/home/SearchBar';
+import CategoryPills from '@/components/home/CategoryPills';
+import RestaurantCard from '@/components/home/RestaurantCard';
+import CartButton from '@/components/cart/CartButton';
+import LocationPicker from '@/components/map/LocationPicker';
+import AdvancedFilters from '@/components/filters/AdvancedFilters';
+import { Link } from 'react-router-dom';
+import { createPageUrl } from '@/utils';
+import { motion } from 'framer-motion';
+
+export default function Home() {
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState(null);
+  const [userAddress, setUserAddress] = useState('Ciudad de México, MX');
+  const [userLat, setUserLat] = useState(19.4326);
+  const [userLng, setUserLng] = useState(-99.1332);
+  const [showMap, setShowMap] = useState(false);
+  const [filters, setFilters] = useState({
+    category: null,
+    minPrice: 0,
+    maxPrice: 500,
+    rating: 0,
+    search: ''
+  });
+
+  const [user, setUser] = useState(null);
+
+  useEffect(() => {
+    base44.auth.me().then(setUser).catch(() => {});
+  }, []);
+
+  const { data: restaurants = [], isLoading: loadingRestaurants } = useQuery({
+    queryKey: ['restaurants'],
+    queryFn: () => base44.entities.Restaurant.filter({ status: 'approved' }, '-rating', 50),
+  });
+
+  const { data: menuItems = [] } = useQuery({
+    queryKey: ['allMenuItems'],
+    queryFn: () => base44.entities.MenuItem.list('-created_date', 200),
+  });
+
+  const { data: cartItems = [] } = useQuery({
+    queryKey: ['cartItems', user?.id],
+    queryFn: () => base44.entities.CartItem.filter({ user_id: user?.id }),
+    enabled: !!user?.id,
+  });
+
+  const { data: topProducts = [] } = useQuery({
+    queryKey: ['topProducts'],
+    queryFn: async () => {
+      const stats = await base44.entities.OrderStats.list('-created_date', 1000);
+      const grouped = stats.reduce((acc, stat) => {
+        if (!acc[stat.menu_item_id]) {
+          acc[stat.menu_item_id] = {
+            menu_item_id: stat.menu_item_id,
+            name: stat.menu_item_name,
+            restaurant_id: stat.restaurant_id,
+            total_quantity: 0
+          };
+        }
+        acc[stat.menu_item_id].total_quantity += stat.quantity;
+        return acc;
+      }, {});
+      return Object.values(grouped).sort((a, b) => b.total_quantity - a.total_quantity).slice(0, 5);
+    },
+  });
+
+  const allCategories = [...new Set(restaurants.map(r => r.category).filter(Boolean))];
+
+  const filteredRestaurants = restaurants.filter(r => {
+    const matchesSearch = !searchQuery || 
+      r.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      r.category?.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesCategory = !selectedCategory && !filters.category || 
+      r.category === selectedCategory || 
+      r.category === filters.category;
+    const matchesRating = r.rating >= filters.rating;
+    const matchesPrice = !r.min_order || (r.min_order >= filters.minPrice && r.min_order <= filters.maxPrice);
+    return matchesSearch && matchesCategory && matchesRating && matchesPrice;
+  });
+
+  const filteredMenuItems = menuItems.filter(item => {
+    if (!searchQuery) return false;
+    const matchesSearch = item.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+           item.description?.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesPrice = item.price >= filters.minPrice && item.price <= filters.maxPrice;
+    return matchesSearch && matchesPrice;
+  });
+
+  const discountedItems = menuItems.filter(item => item.has_discount && item.is_available).slice(0, 5);
+  const featuredRestaurants = filteredRestaurants.filter(r => r.is_featured);
+  const regularRestaurants = filteredRestaurants.filter(r => !r.is_featured);
+
+  const cartTotal = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+  const cartCount = cartItems.reduce((sum, item) => sum + item.quantity, 0);
+
+  const handleLocationConfirm = (location) => {
+    setUserAddress(location.address);
+    setUserLat(location.lat);
+    setUserLng(location.lng);
+    setShowMap(false);
+  };
+
+  if (showMap) {
+    return (
+      <div className="h-screen">
+        <LocationPicker
+          initialPosition={{ lat: userLat, lng: userLng }}
+          onConfirm={handleLocationConfirm}
+          onCancel={() => setShowMap(false)}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 pb-32">
+      {/* Header */}
+      <div className="bg-white px-5 pt-8 pb-6 sticky top-0 z-40 shadow-sm">
+        <SearchBar 
+          value={searchQuery}
+          onChange={setSearchQuery}
+          address={userAddress}
+          onAddressClick={() => setShowMap(true)}
+        />
+      </div>
+
+      <div className="px-5 py-6 space-y-8">
+        {/* Filters Bar */}
+        <div className="flex gap-2 items-center">
+          <AdvancedFilters
+            filters={filters}
+            onFiltersChange={setFilters}
+            categories={allCategories}
+            showPriceRange={true}
+            maxPrice={500}
+            type="restaurants"
+          />
+          {(filters.category || filters.rating > 0 || filters.minPrice > 0 || filters.maxPrice < 500) && (
+            <div className="text-sm text-gray-600">
+              {filteredRestaurants.length} resultado{filteredRestaurants.length !== 1 ? 's' : ''}
+            </div>
+          )}
+        </div>
+
+        {/* Search Results - Menu Items */}
+        {searchQuery && filteredMenuItems.length > 0 && (
+          <section>
+            <h2 className="text-xl font-bold text-gray-900 mb-4">Platillos encontrados</h2>
+            <div className="space-y-3">
+              {filteredMenuItems.map((item, index) => (
+                <Link key={item.id} to={createPageUrl(`Restaurant?id=${item.restaurant_id}`)}>
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: index * 0.05 }}
+                    className="bg-white rounded-2xl p-4 flex gap-4 hover:shadow-md transition-shadow"
+                  >
+                    {item.image && (
+                      <img src={item.image} alt={item.name} className="w-20 h-20 object-cover rounded-xl" />
+                    )}
+                    <div className="flex-1">
+                      <h3 className="font-semibold text-gray-900">{item.name}</h3>
+                      <p className="text-sm text-gray-500 line-clamp-1">{item.description}</p>
+                      <div className="flex items-center gap-2 mt-1">
+                        {item.has_discount ? (
+                          <>
+                            <span className="font-bold text-orange-600">${item.price?.toFixed(2)}</span>
+                            <span className="text-sm text-gray-400 line-through">${item.original_price?.toFixed(2)}</span>
+                            <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full">-{item.discount_percentage}%</span>
+                          </>
+                        ) : (
+                          <span className="font-bold text-orange-600">${item.price?.toFixed(2)}</span>
+                        )}
+                      </div>
+                    </div>
+                  </motion.div>
+                </Link>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Promos - Discount Products */}
+        {!searchQuery && discountedItems.length > 0 && (
+          <section>
+            <h2 className="text-xl font-bold text-gray-900 mb-4">🔥 Ofertas especiales</h2>
+            <div className="overflow-x-auto scrollbar-hide -mx-5 px-5">
+              <div className="flex gap-4 pb-2">
+                {discountedItems.map((item, index) => (
+                  <Link key={item.id} to={createPageUrl(`Restaurant?id=${item.restaurant_id}`)}>
+                    <motion.div
+                      initial={{ opacity: 0, scale: 0.9 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      transition={{ delay: index * 0.1 }}
+                      className="relative w-64 h-40 rounded-2xl overflow-hidden flex-shrink-0"
+                    >
+                      <img
+                        src={item.image || 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400'}
+                        alt={item.name}
+                        className="w-full h-full object-cover"
+                      />
+                      <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent" />
+                      <div className="absolute top-3 right-3 bg-red-500 text-white px-3 py-1 rounded-full text-sm font-bold">
+                        -{item.discount_percentage}% OFF
+                      </div>
+                      <div className="absolute bottom-4 left-4 right-4">
+                        <h3 className="font-bold text-white text-lg mb-1">{item.name}</h3>
+                        <div className="flex items-center gap-2">
+                          <span className="text-white font-bold">${item.price?.toFixed(2)}</span>
+                          <span className="text-white/60 line-through text-sm">${item.original_price?.toFixed(2)}</span>
+                        </div>
+                      </div>
+                    </motion.div>
+                  </Link>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* Top Products */}
+        {!searchQuery && topProducts.length > 0 && (
+          <section>
+            <h2 className="text-xl font-bold text-gray-900 mb-4">⭐ Los más pedidos</h2>
+            <div className="space-y-3">
+              {topProducts.map((product, index) => {
+                const item = menuItems.find(m => m.id === product.menu_item_id);
+                if (!item) return null;
+                return (
+                  <Link key={product.menu_item_id} to={createPageUrl(`Restaurant?id=${product.restaurant_id}`)}>
+                    <motion.div
+                      initial={{ opacity: 0, x: -20 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      transition={{ delay: index * 0.1 }}
+                      className="bg-white rounded-2xl p-4 flex gap-4 hover:shadow-md transition-shadow"
+                    >
+                      <div className="w-8 h-8 rounded-full bg-orange-100 flex items-center justify-center flex-shrink-0">
+                        <span className="text-orange-600 font-bold">#{index + 1}</span>
+                      </div>
+                      {item.image && (
+                        <img src={item.image} alt={item.name} className="w-20 h-20 object-cover rounded-xl" />
+                      )}
+                      <div className="flex-1">
+                        <h3 className="font-semibold text-gray-900">{item.name}</h3>
+                        <p className="text-sm text-gray-500">{product.total_quantity} pedidos</p>
+                        <span className="font-bold text-orange-600">${item.price?.toFixed(2)}</span>
+                      </div>
+                    </motion.div>
+                  </Link>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* Categories */}
+        <section>
+          <h2 className="text-xl font-bold text-gray-900 mb-4">Categorías</h2>
+          <CategoryPills 
+            selectedCategory={selectedCategory}
+            onSelectCategory={setSelectedCategory}
+          />
+        </section>
+
+        {/* Featured */}
+        {featuredRestaurants.length > 0 && (
+          <section>
+            <h2 className="text-xl font-bold text-gray-900 mb-4">⭐ Restaurantes destacados</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+              {loadingRestaurants ? (
+                Array(3).fill(0).map((_, i) => (
+                  <div key={i} className="bg-white rounded-2xl overflow-hidden">
+                    <Skeleton className="h-44 w-full" />
+                    <div className="p-4 space-y-2">
+                      <Skeleton className="h-5 w-3/4" />
+                      <Skeleton className="h-4 w-1/2" />
+                    </div>
+                  </div>
+                ))
+              ) : (
+                featuredRestaurants.map((restaurant, index) => (
+                  <RestaurantCard 
+                    key={restaurant.id} 
+                    restaurant={restaurant} 
+                    index={index}
+                  />
+                ))
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* All Restaurants */}
+        <section>
+          <h2 className="text-xl font-bold text-gray-900 mb-4">
+            {selectedCategory ? selectedCategory : 'Todos los restaurantes'}
+          </h2>
+          {loadingRestaurants ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+              {Array(6).fill(0).map((_, i) => (
+                <div key={i} className="bg-white rounded-2xl overflow-hidden">
+                  <Skeleton className="h-44 w-full" />
+                  <div className="p-4 space-y-2">
+                    <Skeleton className="h-5 w-3/4" />
+                    <Skeleton className="h-4 w-1/2" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : regularRestaurants.length > 0 ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+              {regularRestaurants.map((restaurant, index) => (
+                <RestaurantCard 
+                  key={restaurant.id} 
+                  restaurant={restaurant} 
+                  index={index}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="text-center py-12">
+              <p className="text-gray-500">No se encontraron restaurantes</p>
+            </div>
+          )}
+        </section>
+      </div>
+
+      {/* Cart Button */}
+      <CartButton itemCount={cartCount} total={cartTotal} />
+    </div>
+  );
+}
