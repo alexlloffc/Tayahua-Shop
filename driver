@@ -1,0 +1,444 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { base44 } from '@/api/base44Client';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { Link } from 'react-router-dom';
+import { createPageUrl } from '@/utils';
+import { motion } from 'framer-motion';
+import { Bike, MapPin, DollarSign, TrendingUp, Package, Phone, Navigation, Map } from 'lucide-react';
+import ApprovalStatus from '@/components/ApprovalStatus';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Switch } from '@/components/ui/switch';
+import { Label } from '@/components/ui/label';
+import { toast } from 'sonner';
+import { format } from 'date-fns';
+import { es } from 'date-fns/locale';
+import { useNotifications } from '@/components/notifications/useNotifications';
+
+export default function DriverDashboard() {
+  const queryClient = useQueryClient();
+  const [user, setUser] = useState(null);
+  const [myDriver, setMyDriver] = useState(null);
+  const [locationWatch, setLocationWatch] = useState(null);
+  const { showNotification } = useNotifications();
+  const prevAvailableOrdersRef = useRef([]);
+  const prevMyOrdersRef = useRef([]);
+
+  useEffect(() => {
+    base44.auth.me().then(setUser).catch(() => {});
+  }, []);
+
+  const { data: driverProfile } = useQuery({
+    queryKey: ['driverProfile', user?.id],
+    queryFn: () => base44.entities.Driver.filter({ user_id: user?.id }).then(d => d[0]),
+    enabled: !!user?.id,
+  });
+
+  if (driverProfile && driverProfile.status !== 'approved') {
+    return <ApprovalStatus status={driverProfile.status} type="repartidor" />;
+  }
+
+  const { data: drivers = [] } = useQuery({
+    queryKey: ['myDriver', user?.id],
+    queryFn: () => base44.entities.Driver.filter({ user_id: user?.id }),
+    enabled: !!user?.id,
+  });
+
+  useEffect(() => {
+    if (drivers.length > 0) {
+      setMyDriver(drivers[0]);
+    }
+  }, [drivers]);
+
+  // Update location in real-time when available
+  useEffect(() => {
+    if (myDriver?.is_available && navigator.geolocation) {
+      const watchId = navigator.geolocation.watchPosition(
+        (position) => {
+          base44.entities.Driver.update(myDriver.id, {
+            current_lat: position.coords.latitude,
+            current_lng: position.coords.longitude
+          });
+        },
+        null,
+        { enableHighAccuracy: true, maximumAge: 10000 }
+      );
+      setLocationWatch(watchId);
+      
+      return () => {
+        if (watchId) navigator.geolocation.clearWatch(watchId);
+      };
+    }
+  }, [myDriver?.is_available, myDriver?.id]);
+
+  const { data: availableOrders = [] } = useQuery({
+    queryKey: ['availableOrders'],
+    queryFn: () => base44.entities.Order.filter({ status: 'preparing' }, '-created_date', 50).then(orders => 
+      orders.filter(o => !o.driver_id)
+    ),
+    enabled: !!myDriver?.is_available,
+    refetchInterval: 2000,
+  });
+
+  const { data: myOrders = [] } = useQuery({
+    queryKey: ['myDriverOrders', myDriver?.id],
+    queryFn: () => base44.entities.Order.filter({ driver_id: myDriver?.id }, '-created_date', 100),
+    enabled: !!myDriver?.id,
+    refetchInterval: 3000,
+  });
+
+  // Detect new available orders
+  useEffect(() => {
+    if (availableOrders.length > prevAvailableOrdersRef.current.length && prevAvailableOrdersRef.current.length > 0) {
+      const newOrders = availableOrders.filter(
+        order => !prevAvailableOrdersRef.current.find(prev => prev.id === order.id)
+      );
+      
+      if (newOrders.length > 0) {
+        showNotification(
+          `🚀 ${newOrders.length} nuevo${newOrders.length > 1 ? 's' : ''} pedido${newOrders.length > 1 ? 's' : ''} disponible${newOrders.length > 1 ? 's' : ''}`,
+          { body: `Pedido de ${newOrders[0].restaurant_name} - $${newOrders[0].delivery_fee?.toFixed(2)}` }
+        );
+      }
+    }
+    prevAvailableOrdersRef.current = availableOrders;
+  }, [availableOrders, showNotification]);
+
+  // Detect changes in assigned orders
+  useEffect(() => {
+    if (myOrders.length > 0 && prevMyOrdersRef.current.length > 0) {
+      myOrders.forEach(order => {
+        const prevOrder = prevMyOrdersRef.current.find(prev => prev.id === order.id);
+        if (prevOrder && prevOrder.status !== order.status) {
+          showNotification(
+            '📦 Actualización de pedido',
+            { body: `Pedido #${order.id.slice(-6)} cambió a: ${order.status}` }
+          );
+        }
+      });
+    }
+    prevMyOrdersRef.current = myOrders;
+  }, [myOrders, showNotification]);
+
+  const toggleAvailabilityMutation = useMutation({
+    mutationFn: (isAvailable) => base44.entities.Driver.update(myDriver.id, { is_available: isAvailable }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['myDriver'] });
+      toast.success(myDriver.is_available ? 'Ahora estás fuera de línea' : 'Ahora estás disponible');
+    }
+  });
+
+  const acceptOrderMutation = useMutation({
+    mutationFn: async (order) => {
+      // Get current location
+      return new Promise((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(
+          async (position) => {
+            try {
+              await base44.entities.Order.update(order.id, {
+                driver_id: myDriver.id,
+                driver_name: myDriver.full_name,
+                driver_phone: myDriver.phone,
+                driver_lat: position.coords.latitude,
+                driver_lng: position.coords.longitude,
+                status: 'driver_on_way_to_restaurant'
+              });
+              resolve();
+            } catch (error) {
+              reject(error);
+            }
+          },
+          reject
+        );
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['availableOrders'] });
+      queryClient.invalidateQueries({ queryKey: ['myDriverOrders'] });
+      toast.success('¡Pedido aceptado!');
+    }
+  });
+
+  const markPickedUpMutation = useMutation({
+    mutationFn: (orderId) => base44.entities.Order.update(orderId, { status: 'picked_up' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['myDriverOrders'] });
+      toast.success('Pedido recogido');
+    }
+  });
+
+  const startDeliveryMutation = useMutation({
+    mutationFn: (orderId) => base44.entities.Order.update(orderId, { status: 'driver_on_way_to_customer' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['myDriverOrders'] });
+      toast.success('En camino al cliente');
+    }
+  });
+
+  const confirmCashPaymentMutation = useMutation({
+    mutationFn: (order) => base44.entities.Order.update(order.id, { 
+      status: 'delivered',
+      payment_status: 'paid_cash',
+      cash_payment_confirmed_by: myDriver.id,
+      cash_payment_confirmed_at: new Date().toISOString()
+    }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['myDriverOrders'] });
+      toast.success('✓ Pago confirmado y pedido completado');
+    }
+  });
+
+  const activeDeliveries = myOrders.filter(o => 
+    ['driver_on_way_to_restaurant', 'picked_up', 'driver_on_way_to_customer'].includes(o.status)
+  );
+  const completedToday = myOrders.filter(o => {
+    if (o.status !== 'delivered') return false;
+    const orderDate = new Date(o.created_date);
+    const today = new Date();
+    return orderDate.toDateString() === today.toDateString();
+  });
+
+  if (!myDriver) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
+        <Card className="text-center py-12 max-w-md">
+          <div className="w-20 h-20 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-6">
+            <Bike className="w-10 h-10 text-blue-600" />
+          </div>
+          <h1 className="text-2xl font-bold text-gray-900 mb-2">Conviértete en repartidor</h1>
+          <p className="text-gray-500 mb-6">Gana dinero entregando pedidos</p>
+          <Link to={createPageUrl('RegisterDriver')}>
+            <Button className="bg-blue-600 hover:bg-blue-700 rounded-full px-8">
+              Registrarme ahora
+            </Button>
+          </Link>
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 pb-20">
+      <div className="bg-gradient-to-br from-blue-600 to-blue-700 text-white px-5 py-8">
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-3">
+            {myDriver.photo ? (
+              <img src={myDriver.photo} alt={myDriver.full_name} className="w-12 h-12 rounded-full object-cover" />
+            ) : (
+              <div className="w-12 h-12 bg-white/20 rounded-full flex items-center justify-center">
+                <Bike className="w-6 h-6" />
+              </div>
+            )}
+            <div>
+              <h1 className="text-xl font-bold">{myDriver.full_name}</h1>
+              <p className="text-white/80 text-sm">⭐ {myDriver.rating?.toFixed(1)} • {myDriver.total_deliveries} entregas</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between bg-white/10 backdrop-blur-sm rounded-2xl p-4">
+          <div>
+            <Label htmlFor="available" className="text-white font-semibold">
+              {myDriver.is_available ? 'Disponible' : 'No disponible'}
+            </Label>
+            <p className="text-white/70 text-xs">
+              {myDriver.is_available ? 'Recibiendo pedidos' : 'No recibirás pedidos'}
+            </p>
+          </div>
+          <Switch
+            id="available"
+            checked={myDriver.is_available}
+            onCheckedChange={(checked) => toggleAvailabilityMutation.mutate(checked)}
+          />
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 mt-4">
+          <div className="bg-white/10 backdrop-blur-sm rounded-2xl p-4">
+            <Package className="w-6 h-6 mb-2" />
+            <p className="text-2xl font-bold">{activeDeliveries.length}</p>
+            <p className="text-white/80 text-xs">En curso</p>
+          </div>
+          <div className="bg-white/10 backdrop-blur-sm rounded-2xl p-4">
+            <DollarSign className="w-6 h-6 mb-2" />
+            <p className="text-2xl font-bold">{completedToday.length}</p>
+            <p className="text-white/80 text-xs">Hoy</p>
+          </div>
+        </div>
+      </div>
+
+      <div className="px-5 py-6 space-y-6">
+        {activeDeliveries.length > 0 && (
+          <section>
+            <h2 className="text-lg font-bold text-gray-900 mb-3">Entregas en curso</h2>
+            <div className="space-y-3">
+              {activeDeliveries.map(order => (
+                <Card key={order.id}>
+                  <CardContent className="p-5">
+                    <div className="flex items-start justify-between mb-3">
+                      <div>
+                        <h3 className="font-bold text-gray-900">Pedido #{order.id.slice(-6)}</h3>
+                        <p className="text-sm text-gray-500">{order.restaurant_name}</p>
+                      </div>
+                      <Badge className={
+                        order.status === 'driver_on_way_to_restaurant' ? 'bg-orange-100 text-orange-700' :
+                        order.status === 'picked_up' ? 'bg-purple-100 text-purple-700' :
+                        'bg-blue-100 text-blue-700'
+                      }>
+                        {order.status === 'driver_on_way_to_restaurant' ? 'Recoger' :
+                         order.status === 'picked_up' ? 'Recogido' :
+                         'Entregar'}
+                      </Badge>
+                    </div>
+
+                    {order.payment_method === 'cash' && (
+                      <div className="bg-green-50 border-2 border-green-200 rounded-xl p-3 mb-4">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-2xl">💵</span>
+                          <span className="font-bold text-green-900">COBRAR EN EFECTIVO</span>
+                        </div>
+                        <p className="text-xl font-bold text-green-700">
+                          Total: ${order.total?.toFixed(2)}
+                        </p>
+                        <p className="text-sm text-green-600 mt-1">
+                          El cliente pagará al recibir el pedido
+                        </p>
+                      </div>
+                    )}
+
+                    <div className="space-y-2 mb-4">
+                      <div className="flex items-center gap-2 text-sm">
+                        <Phone className="w-4 h-4 text-blue-600" />
+                        <a href={`tel:${order.customer_phone}`} className="text-blue-600">
+                          {order.customer_name} - {order.customer_phone}
+                        </a>
+                      </div>
+                      <div className="flex items-start gap-2 text-sm">
+                        <MapPin className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
+                        <span className="text-gray-600">{order.delivery_address}</span>
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <Link to={createPageUrl(`TrackOrder?orderId=${order.id}`)}>
+                        <Button variant="outline" className="w-full">
+                          <Map className="w-4 h-4 mr-2" />
+                          Ver mapa en tiempo real
+                        </Button>
+                      </Link>
+                      
+                      {order.status === 'driver_on_way_to_restaurant' && (
+                        <>
+                          <Button
+                            variant="outline"
+                            className="w-full border-orange-300 text-orange-700 hover:bg-orange-50"
+                            onClick={() => window.open(`https://www.google.com/maps/dir/?api=1&destination=${order.restaurant_lat},${order.restaurant_lng}`, '_blank')}
+                          >
+                            <Navigation className="w-4 h-4 mr-2" />
+                            Navegar al restaurante
+                          </Button>
+                          <Button
+                            className="w-full bg-purple-600 hover:bg-purple-700"
+                            onClick={() => markPickedUpMutation.mutate(order.id)}
+                          >
+                            ✓ Pedido recogido
+                          </Button>
+                        </>
+                      )}
+
+                      {order.status === 'picked_up' && (
+                        <Button
+                          className="w-full bg-blue-600 hover:bg-blue-700"
+                          onClick={() => startDeliveryMutation.mutate(order.id)}
+                        >
+                          🚀 Ir al cliente
+                        </Button>
+                      )}
+
+                      {order.status === 'driver_on_way_to_customer' && (
+                        <>
+                          <Button
+                            variant="outline"
+                            className="w-full border-blue-300 text-blue-700 hover:bg-blue-50"
+                            onClick={() => window.open(`https://www.google.com/maps/dir/?api=1&destination=${order.delivery_lat},${order.delivery_lng}`, '_blank')}
+                          >
+                            <Navigation className="w-4 h-4 mr-2" />
+                            Navegar al cliente
+                          </Button>
+                          <Button
+                            className="w-full bg-green-600 hover:bg-green-700 text-lg py-6"
+                            onClick={() => confirmCashPaymentMutation.mutate(order)}
+                          >
+                            💵 Confirmar cobro en efectivo
+                          </Button>
+                        </>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {myDriver.is_available && availableOrders.length > 0 && (
+          <section>
+            <h2 className="text-lg font-bold text-gray-900 mb-3">Pedidos disponibles</h2>
+            <div className="space-y-3">
+              {availableOrders.map(order => (
+                <motion.div
+                  key={order.id}
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                >
+                  <Card className="border-blue-200">
+                    <CardContent className="p-5">
+                      <div className="flex items-start justify-between mb-3">
+                        <div>
+                          <h3 className="font-bold text-gray-900">{order.restaurant_name}</h3>
+                          <p className="text-sm text-gray-500">
+                            {order.created_date && format(new Date(order.created_date), "HH:mm", { locale: es })}
+                          </p>
+                        </div>
+                        <span className="font-bold text-green-600">${order.delivery_fee?.toFixed(2)}</span>
+                      </div>
+
+                      {order.payment_method === 'cash' && (
+                        <div className="bg-green-50 border border-green-200 rounded-xl p-2 mb-3 flex items-center gap-2">
+                          <span className="text-lg">💵</span>
+                          <div>
+                            <p className="text-xs font-semibold text-green-900">COBRAR EN EFECTIVO</p>
+                            <p className="text-sm font-bold text-green-700">${order.total?.toFixed(2)}</p>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="flex items-start gap-2 text-sm mb-4">
+                        <MapPin className="w-4 h-4 text-gray-400 mt-0.5 flex-shrink-0" />
+                        <span className="text-gray-600 line-clamp-2">{order.delivery_address}</span>
+                      </div>
+                      <Button
+                        onClick={() => acceptOrderMutation.mutate(order)}
+                        disabled={acceptOrderMutation.isPending}
+                        className="w-full bg-blue-600 hover:bg-blue-700"
+                      >
+                        Aceptar pedido
+                      </Button>
+                    </CardContent>
+                  </Card>
+                </motion.div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {myDriver.is_available && availableOrders.length === 0 && activeDeliveries.length === 0 && (
+          <div className="text-center py-16">
+            <Package className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+            <p className="text-gray-500">No hay pedidos disponibles</p>
+            <p className="text-sm text-gray-400">Te notificaremos cuando haya nuevos</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
