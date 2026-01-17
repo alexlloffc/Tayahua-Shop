@@ -1,0 +1,440 @@
+import React, { useState, useEffect } from 'react';
+import { base44 } from '@/api/base44Client';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { Link, useNavigate } from 'react-router-dom';
+import { createPageUrl } from '@/utils';
+import { motion, AnimatePresence } from 'framer-motion';
+import { ArrowLeft, MapPin, CreditCard, Banknote, ShoppingBag, Trash2 } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
+import { Label } from '@/components/ui/label';
+import { toast } from 'sonner';
+import CartItemCard from '@/components/cart/CartItemCard';
+import LocationPicker from '@/components/map/LocationPicker';
+
+export default function Cart() {
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const [user, setUser] = useState(null);
+  const [deliveryAddress, setDeliveryAddress] = useState('');
+  const [deliveryLat, setDeliveryLat] = useState(null);
+  const [deliveryLng, setDeliveryLng] = useState(null);
+  const [customerName, setCustomerName] = useState('');
+  const [customerPhone, setCustomerPhone] = useState('');
+  const [street, setStreet] = useState('');
+  const [houseNumber, setHouseNumber] = useState('');
+  const [reference, setReference] = useState('');
+  const [paymentMethod, setPaymentMethod] = useState('cash');
+  const [orderNotes, setOrderNotes] = useState('');
+  const [showMap, setShowMap] = useState(false);
+  const [realtimeLocation, setRealtimeLocation] = useState(null);
+  const [locationError, setLocationError] = useState(null);
+
+  useEffect(() => {
+    base44.auth.me().then(u => {
+      setUser(u);
+      if (u.full_name) setCustomerName(u.full_name);
+      if (u.phone) setCustomerPhone(u.phone);
+    }).catch(() => {});
+  }, []);
+
+  // Get realtime location
+  useEffect(() => {
+    if (navigator.geolocation) {
+      const watchId = navigator.geolocation.watchPosition(
+        (position) => {
+          setRealtimeLocation({
+            lat: position.coords.latitude,
+            lng: position.coords.longitude
+          });
+          setLocationError(null);
+        },
+        (error) => {
+          setLocationError('No se pudo obtener tu ubicación en tiempo real');
+          setRealtimeLocation(null);
+        },
+        { enableHighAccuracy: true, maximumAge: 10000, timeout: 5000 }
+      );
+      return () => navigator.geolocation.clearWatch(watchId);
+    } else {
+      setLocationError('Tu dispositivo no soporta geolocalización');
+    }
+  }, []);
+
+  const { data: cartItems = [], isLoading } = useQuery({
+    queryKey: ['cartItems', user?.id],
+    queryFn: () => base44.entities.CartItem.filter({ user_id: user?.id }),
+    enabled: !!user?.id,
+  });
+
+  const { data: restaurant } = useQuery({
+    queryKey: ['cartRestaurant', cartItems[0]?.restaurant_id],
+    queryFn: () => base44.entities.Restaurant.filter({ id: cartItems[0]?.restaurant_id }).then(r => r[0]),
+    enabled: !!cartItems[0]?.restaurant_id,
+  });
+
+  const updateQuantityMutation = useMutation({
+    mutationFn: ({ id, quantity }) => base44.entities.CartItem.update(id, { quantity }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['cartItems'] })
+  });
+
+  const removeItemMutation = useMutation({
+    mutationFn: (id) => base44.entities.CartItem.delete(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['cartItems'] })
+  });
+
+  const clearCartMutation = useMutation({
+    mutationFn: async () => {
+      await Promise.all(cartItems.map(item => base44.entities.CartItem.delete(item.id)));
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['cartItems'] })
+  });
+
+  const handleLocationConfirm = (location) => {
+    setDeliveryAddress(location.address);
+    setDeliveryLat(location.lat);
+    setDeliveryLng(location.lng);
+    
+    // Try to extract street from address
+    const addressParts = location.address.split(',');
+    if (addressParts.length > 0) {
+      setStreet(addressParts[0].trim());
+    }
+    
+    setShowMap(false);
+  };
+
+  const createOrderMutation = useMutation({
+    mutationFn: async () => {
+      if (!realtimeLocation) {
+        throw new Error('Debes activar tu ubicación en tiempo real para confirmar el pedido');
+      }
+
+      if (!deliveryLat || !deliveryLng) {
+        throw new Error('Debes seleccionar tu ubicación en el mapa');
+      }
+      
+      const minOrder = restaurant?.min_order || 0;
+      if (subtotal < minOrder) {
+        throw new Error(`El pedido mínimo es de $${minOrder}`);
+      }
+
+      const restaurantId = cartItems[0]?.restaurant_id;
+      const restaurantName = cartItems[0]?.restaurant_name;
+      const fullAddress = `${street} ${houseNumber}${reference ? ', ' + reference : ''}`;
+
+      // Calculate savings from discounted items in cart
+      let totalSavings = 0;
+      for (const item of cartItems) {
+        const menuItem = await base44.entities.MenuItem.filter({ id: item.menu_item_id }).then(m => m[0]);
+        if (menuItem?.has_discount) {
+          const savings = (menuItem.original_price - menuItem.price) * item.quantity;
+          totalSavings += savings;
+        }
+      }
+      
+      const order = await base44.entities.Order.create({
+        restaurant_id: restaurantId,
+        restaurant_name: restaurantName,
+        restaurant_lat: restaurant?.lat,
+        restaurant_lng: restaurant?.lng,
+        customer_id: user?.id,
+        items: cartItems.map(item => ({
+          menu_item_id: item.menu_item_id,
+          name: item.name,
+          price: item.price,
+          quantity: item.quantity,
+          notes: item.notes
+        })),
+        subtotal,
+        delivery_fee: deliveryFee,
+        total,
+        total_savings: totalSavings,
+        delivery_address: fullAddress,
+        delivery_lat: deliveryLat,
+        delivery_lng: deliveryLng,
+        customer_realtime_lat: realtimeLocation.lat,
+        customer_realtime_lng: realtimeLocation.lng,
+        customer_phone: customerPhone,
+        customer_name: customerName,
+        payment_method: 'cash',
+        payment_status: 'pending',
+        notes: orderNotes,
+        status: 'pending',
+        can_be_cancelled: true,
+        estimated_delivery: '30-45 min',
+        restaurant_payment_amount: subtotal
+      });
+
+      // Create order stats
+      for (const item of cartItems) {
+        await base44.entities.OrderStats.create({
+          order_id: order.id,
+          menu_item_id: item.menu_item_id,
+          menu_item_name: item.name,
+          restaurant_id: restaurantId,
+          quantity: item.quantity,
+          date: new Date().toISOString().split('T')[0]
+        });
+      }
+
+      await clearCartMutation.mutateAsync();
+      return order;
+    },
+    onSuccess: (order) => {
+      toast.success('¡Pedido realizado con éxito!');
+      navigate(createPageUrl(`Orders`));
+    },
+    onError: (error) => {
+      toast.error(error.message);
+    }
+  });
+
+  const subtotal = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+  const deliveryFee = cartItems.length > 0 ? 20 : 0;
+  const total = subtotal + deliveryFee;
+
+  const hasItemsFromDifferentRestaurants = 
+    new Set(cartItems.map(item => item.restaurant_id)).size > 1;
+
+  if (showMap) {
+    return (
+      <div className="h-screen">
+        <LocationPicker
+          initialPosition={deliveryLat ? { lat: deliveryLat, lng: deliveryLng } : null}
+          onConfirm={handleLocationConfirm}
+          onCancel={() => setShowMap(false)}
+        />
+      </div>
+    );
+  }
+
+  if (cartItems.length === 0 && !isLoading) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-5">
+        <div className="bg-white rounded-3xl p-10 text-center shadow-sm">
+          <div className="w-20 h-20 bg-orange-100 rounded-full flex items-center justify-center mx-auto mb-6">
+            <ShoppingBag className="w-10 h-10 text-orange-500" />
+          </div>
+          <h2 className="text-xl font-bold text-gray-900 mb-2">Tu carrito está vacío</h2>
+          <p className="text-gray-500 mb-6">Agrega platillos deliciosos para comenzar</p>
+          <Link to={createPageUrl('Home')}>
+            <Button className="bg-orange-500 hover:bg-orange-600 rounded-full px-8">
+              Explorar restaurantes
+            </Button>
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 pb-40">
+      {/* Header */}
+      <div className="bg-white px-5 py-6 sticky top-0 z-40 shadow-sm">
+        <div className="flex items-center gap-4">
+          <Link to={createPageUrl('Home')}>
+            <Button size="icon" variant="ghost" className="rounded-full">
+              <ArrowLeft className="w-5 h-5" />
+            </Button>
+          </Link>
+          <h1 className="text-xl font-bold text-gray-900">Mi carrito</h1>
+          {cartItems.length > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="ml-auto text-red-500 hover:text-red-600 hover:bg-red-50"
+              onClick={() => clearCartMutation.mutate()}
+            >
+              <Trash2 className="w-4 h-4 mr-1" />
+              Vaciar
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="px-5 py-6 space-y-6">
+        {/* Cart Items */}
+        <section className="space-y-3">
+          <AnimatePresence>
+            {cartItems.map(item => (
+              <CartItemCard
+                key={item.id}
+                item={item}
+                onUpdateQuantity={(id, qty) => updateQuantityMutation.mutate({ id, quantity: qty })}
+                onRemove={(id) => removeItemMutation.mutate(id)}
+              />
+            ))}
+          </AnimatePresence>
+        </section>
+
+        {hasItemsFromDifferentRestaurants && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-800">
+            ⚠️ Tienes productos de diferentes restaurantes. Solo se enviará el pedido del primer restaurante.
+          </div>
+        )}
+
+        {/* Delivery Address */}
+        <section className="bg-white rounded-2xl p-5 space-y-4">
+          <div className="flex items-center gap-2 mb-2">
+            <MapPin className="w-5 h-5 text-orange-500" />
+            <h2 className="font-bold text-gray-900">Dirección de entrega</h2>
+          </div>
+          
+          <div className="space-y-3">
+            <Input
+              placeholder="Nombre completo *"
+              value={customerName}
+              onChange={(e) => setCustomerName(e.target.value)}
+              className="rounded-xl"
+            />
+            
+            <Input
+              placeholder="Teléfono de contacto *"
+              value={customerPhone}
+              onChange={(e) => setCustomerPhone(e.target.value)}
+              className="rounded-xl"
+            />
+            
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setShowMap(true)}
+              className="w-full justify-start text-left h-auto py-3"
+            >
+              <MapPin className="w-4 h-4 mr-2 text-orange-500 flex-shrink-0" />
+              <span className="text-sm line-clamp-2">
+                {deliveryAddress || 'Selecciona tu ubicación en el mapa *'}
+              </span>
+            </Button>
+            
+            <div className="grid grid-cols-2 gap-3">
+              <Input
+                placeholder="Calle *"
+                value={street}
+                onChange={(e) => setStreet(e.target.value)}
+                className="rounded-xl"
+              />
+              <Input
+                placeholder="Número *"
+                value={houseNumber}
+                onChange={(e) => setHouseNumber(e.target.value)}
+                className="rounded-xl"
+              />
+            </div>
+            
+            <Input
+              placeholder="Referencia (ej: casa azul, edificio 3)"
+              value={reference}
+              onChange={(e) => setReference(e.target.value)}
+              className="rounded-xl"
+            />
+          </div>
+        </section>
+
+        {/* Realtime Location Warning */}
+        <section className={`rounded-2xl p-5 ${realtimeLocation ? 'bg-green-50 border-2 border-green-200' : 'bg-amber-50 border-2 border-amber-300'}`}>
+          <div className="flex items-start gap-3">
+            <MapPin className={`w-6 h-6 mt-0.5 ${realtimeLocation ? 'text-green-600' : 'text-amber-600'}`} />
+            <div className="flex-1">
+              <h3 className={`font-semibold mb-1 ${realtimeLocation ? 'text-green-900' : 'text-amber-900'}`}>
+                {realtimeLocation ? '✓ Ubicación en tiempo real activa' : '⚠️ Ubicación en tiempo real requerida'}
+              </h3>
+              <p className={`text-sm ${realtimeLocation ? 'text-green-700' : 'text-amber-700'}`}>
+                {realtimeLocation 
+                  ? 'Tu ubicación está siendo compartida correctamente'
+                  : 'Debes activar tu ubicación en tiempo real para confirmar el pedido'
+                }
+              </p>
+              {locationError && (
+                <p className="text-sm text-red-600 mt-2">{locationError}</p>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {/* Payment Method */}
+        <section className="bg-white rounded-2xl p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <Banknote className="w-5 h-5 text-orange-500" />
+            <h2 className="font-bold text-gray-900">Método de pago</h2>
+          </div>
+          <div className="flex items-center space-x-3 p-4 rounded-xl bg-green-50 border-2 border-green-200">
+            <Banknote className="w-6 h-6 text-green-600" />
+            <div className="flex-1">
+              <p className="font-semibold text-gray-900">💵 EFECTIVO al recibir</p>
+              <p className="text-sm text-gray-600">Paga al repartidor al recibir tu pedido</p>
+            </div>
+          </div>
+          <div className="mt-3 bg-blue-50 rounded-xl p-3">
+            <p className="text-sm text-blue-700">
+              💡 Total a pagar en efectivo: <span className="font-bold">${total.toFixed(2)}</span>
+            </p>
+          </div>
+        </section>
+
+        {/* Notes */}
+        <section className="bg-white rounded-2xl p-5">
+          <h2 className="font-bold text-gray-900 mb-4">Notas del pedido</h2>
+          <Textarea
+            placeholder="Instrucciones especiales, alergias, etc."
+            value={orderNotes}
+            onChange={(e) => setOrderNotes(e.target.value)}
+            className="rounded-xl resize-none"
+            rows={3}
+          />
+        </section>
+
+        {/* Order Summary */}
+        <section className="bg-white rounded-2xl p-5 space-y-3">
+          <h2 className="font-bold text-gray-900 mb-2">Resumen</h2>
+          <div className="flex justify-between text-gray-600">
+            <span>Subtotal</span>
+            <span>${subtotal.toFixed(2)}</span>
+          </div>
+          <div className="flex justify-between text-gray-600">
+            <span>Envío</span>
+            <span>$20.00</span>
+          </div>
+          {(() => {
+            const originalTotal = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+            const savings = 0; // Calculado al crear orden
+            return savings > 0 && (
+              <div className="flex justify-between text-green-600 font-medium">
+                <span>Ahorros</span>
+                <span>-${savings.toFixed(2)}</span>
+              </div>
+            );
+          })()}
+          {restaurant?.min_order && subtotal < restaurant.min_order && (
+            <div className="bg-amber-50 rounded-xl p-3 text-sm text-amber-700">
+              ⚠️ Pedido mínimo: ${restaurant.min_order}. Faltan ${(restaurant.min_order - subtotal).toFixed(2)}
+            </div>
+          )}
+          <div className="border-t pt-3 flex justify-between text-lg font-bold">
+            <span>Total</span>
+            <span>${total.toFixed(2)}</span>
+          </div>
+        </section>
+      </div>
+
+      {/* Checkout Button */}
+      <div className="fixed bottom-0 left-0 right-0 bg-white border-t p-5">
+        <Button
+          onClick={() => createOrderMutation.mutate()}
+          disabled={!realtimeLocation || !customerName || !customerPhone || !deliveryLat || !deliveryLng || !street || !houseNumber || createOrderMutation.isPending || (restaurant?.min_order && subtotal < restaurant.min_order)}
+          className="w-full bg-gradient-to-r from-orange-500 to-orange-600 hover:from-orange-600 hover:to-orange-700 text-white rounded-2xl py-6 text-lg font-semibold disabled:opacity-50"
+        >
+          {createOrderMutation.isPending ? 'Procesando...' : !realtimeLocation ? '🔒 Activa tu ubicación' : `Confirmar pedido • $${total.toFixed(2)}`}
+        </Button>
+        {!realtimeLocation && (
+          <p className="text-center text-sm text-amber-600 mt-2">
+            Permite el acceso a tu ubicación para continuar
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
